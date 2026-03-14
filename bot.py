@@ -1,15 +1,13 @@
 """
 Telegram-бот | «Квантовый разлом» — диагностический тест
-Стек: aiogram 3.x, FSM, YooMoney, aiohttp webhook, reportlab PDF
+ТЕСТОВАЯ ВЕРСИЯ: PDF без оплаты
+Стек: aiogram 3.x, FSM, aiohttp webhook, reportlab PDF
 """
 
 import asyncio
-import hashlib
 import logging
 import os
-import uuid
 import io
-from typing import Optional
 
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
@@ -26,7 +24,6 @@ from aiogram.types import (
     Message,
 )
 from aiohttp import web
-from yoomoney import Client, Quickpay
 
 from reportlab.lib.pagesizes import A4
 from reportlab.lib.styles import ParagraphStyle
@@ -39,17 +36,10 @@ from reportlab.lib.enums import TA_CENTER, TA_JUSTIFY
 # КОНФИГУРАЦИЯ
 # ──────────────────────────────────────────────
 BOT_TOKEN: str = os.getenv("BOT_TOKEN", "REPLACE_WITH_NEW_TOKEN")
-YOOMONEY_TOKEN: str = os.getenv("YOOMONEY_TOKEN", "YOUR_YOOMONEY_TOKEN")
-YOOMONEY_WALLET: str = os.getenv("YOOMONEY_WALLET", "YOUR_WALLET_NUMBER")
-YOOMONEY_SECRET: str = os.getenv("YOOMONEY_SECRET", "YOUR_YOOMONEY_SECRET")
 WEBHOOK_HOST: str = os.getenv("WEBHOOK_HOST", "https://yourdomain.com")
 WEBHOOK_PATH: str = "/webhook/telegram"
 WEBHOOK_URL: str = f"{WEBHOOK_HOST}{WEBHOOK_PATH}"
-YOOMONEY_NOTIFY_PATH: str = "/webhook/yoomoney"
 WEB_PORT: int = int(os.getenv("PORT", 8080))
-
-PAYMENT_AMOUNT: float = 390.0
-PAYMENT_LABEL_PREFIX: str = "report_"
 
 # ──────────────────────────────────────────────
 # ЛОГИРОВАНИЕ
@@ -151,11 +141,6 @@ QUESTIONS: list[dict] = [
 # ──────────────────────────────────────────────
 class TestState(StatesGroup):
     answering = State()
-    awaiting_payment = State()
-
-
-pending_payments: dict[str, int] = {}
-user_scores: dict[int, int] = {}
 
 
 # ══════════════════════════════════════════════
@@ -436,73 +421,38 @@ def build_question_keyboard(q_index: int) -> InlineKeyboardMarkup:
     ])
 
 
-def build_payment_keyboard(pay_url: str) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(
-            text="💳 Оплатить доступ к отчёту  390 руб  [было 690 руб]",
-            url=pay_url,
-        )],
-        [InlineKeyboardButton(text="🔄 Проверить оплату", callback_data="check_payment")],
-    ])
-
-
 def get_verdict(score: int) -> str:
     if score <= 8:
         label, desc = "ТИП I — УСТОЙЧИВОСТЬ", (
             "Система интегрирована. Паттерны осознаны. Ресурс доступен.\n"
             "Вектор — расширение.\n\n"
-            "Отчёт содержит карту роста и протокол следующего уровня."
+            "Генерирую персональный отчёт..."
         )
     elif score <= 12:
         label, desc = "ТИП II — ФОНОВОЕ НАПРЯЖЕНИЕ", (
             "Адаптация работает — но стоит ресурса.\n"
             "Система стабильна, движение — затруднено.\n\n"
-            "Отчёт содержит источники утечки и протокол восстановления баланса."
+            "Генерирую персональный отчёт..."
         )
     elif score <= 15:
         label, desc = "ТИП III — СИСТЕМНАЯ ПЕРЕГРУЗКА", (
             "Компенсация на пределе. Стабильность — иллюзия.\n"
             "Разрыв между внешним и внутренним — значительный.\n\n"
-            "Отчёт содержит механику перегрузки и экстренный протокол."
+            "Генерирую персональный отчёт..."
         )
     elif score <= 18:
         label, desc = "ТИП IV — КРИТИЧЕСКОЕ ИСТОЩЕНИЕ", (
             "Механизмы адаптации исчерпаны.\n"
             "Система держится на инерции и волевом контроле.\n\n"
-            "Отчёт содержит приоритетный протокол и карту выхода."
+            "Генерирую персональный отчёт..."
         )
     else:
         label, desc = "ТИП V — ТОЧКА РАЗРЫВА", (
             "Максимальный индекс нагрузки по всем векторам.\n"
             "Старая система больше не функционирует.\n\n"
-            "Отчёт содержит протокол первых 72 часов и план на 30 дней."
+            "Генерирую персональный отчёт..."
         )
     return f"░░ ВЕРДИКТ: {label} ░░\n\n{desc}"
-
-
-def create_payment_link(user_id: int, score: int) -> tuple[str, str]:
-    label = f"{PAYMENT_LABEL_PREFIX}{user_id}_{uuid.uuid4().hex[:8]}"
-    quickpay = Quickpay(
-        receiver=YOOMONEY_WALLET,
-        quickpay_form="shop",
-        targets=f"Доступ к отчёту QuanTum Break (score={score})",
-        paymentType="SB",
-        sum=PAYMENT_AMOUNT,
-        label=label,
-    )
-    return quickpay.base_url, label
-
-
-def verify_payment_by_history(label: str) -> bool:
-    try:
-        client = Client(YOOMONEY_TOKEN)
-        history = client.operation_history(label=label)
-        for op in history.operations:
-            if op.label == label and op.status == "success" and float(op.amount) >= PAYMENT_AMOUNT:
-                return True
-    except Exception as exc:
-        logger.error("YooMoney history check failed: %s", exc)
-    return False
 
 
 # ──────────────────────────────────────────────
@@ -563,46 +513,11 @@ async def cb_answer(callback: CallbackQuery, state: FSMContext) -> None:
             reply_markup=build_question_keyboard(next_q),
         )
     else:
-        user_id = callback.from_user.id
-        user_scores[user_id] = new_score
-        await state.update_data(score=new_score)
-
-        try:
-            pay_url, label = create_payment_link(user_id, new_score)
-            pending_payments[label] = user_id
-            await state.update_data(payment_label=label)
-            await state.set_state(TestState.awaiting_payment)
-            await callback.message.edit_text(
-                f"{get_verdict(new_score)}\n\n"
-                "──────────────────────\n"
-                "Полный отчёт с протоколом действий <b>заблокирован</b>.\n"
-                "Для разблокировки — произведите оплату.",
-                reply_markup=build_payment_keyboard(pay_url),
-            )
-        except Exception as exc:
-            logger.error("Payment link creation failed for user %s: %s", user_id, exc)
-            await callback.message.edit_text("Система временно недоступна. Попробуйте /start")
+        # ── ТЕСТОВЫЙ РЕЖИМ: PDF без оплаты ──
+        await callback.message.edit_text(get_verdict(new_score))
+        await deliver_report(callback.message, new_score, state)
 
     await callback.answer()
-
-
-@router.callback_query(StateFilter(TestState.awaiting_payment), F.data == "check_payment")
-async def cb_check_payment(callback: CallbackQuery, state: FSMContext) -> None:
-    data = await state.get_data()
-    label: Optional[str] = data.get("payment_label")
-    score: int = data.get("score", 0)
-
-    if not label:
-        await callback.answer("Данные платежа не найдены. Пройдите тест заново.", show_alert=True)
-        return
-
-    await callback.answer("Проверяю платёж…")
-    if verify_payment_by_history(label):
-        await deliver_report(callback.message, score, state)
-    else:
-        await callback.message.answer(
-            "░ Оплата пока не зафиксирована.\nПосле оплаты нажмите «Проверить оплату» повторно."
-        )
 
 
 async def deliver_report(message: Message, score: int, state: FSMContext) -> None:
@@ -611,7 +526,7 @@ async def deliver_report(message: Message, score: int, state: FSMContext) -> Non
         await message.answer_document(
             BufferedInputFile(pdf_bytes, filename="quantum_break_report.pdf"),
             caption=(
-                "█ ОТЧЁТ РАЗБЛОКИРОВАН █\n\n"
+                "█ ОТЧЁТ СФОРМИРОВАН █\n\n"
                 "Изучите протокол. Следуйте инструкциям.\n"
                 "Система не ждёт — но и не торопит."
             ),
@@ -621,45 +536,6 @@ async def deliver_report(message: Message, score: int, state: FSMContext) -> Non
     except Exception as exc:
         logger.error("Failed to generate/send PDF: %s", exc)
         await message.answer("Ошибка при генерации отчёта. Свяжитесь с поддержкой.")
-
-
-# ──────────────────────────────────────────────
-# YOOMONEY WEBHOOK
-# ──────────────────────────────────────────────
-async def yoomoney_notify_handler(request: web.Request) -> web.Response:
-    try:
-        data = await request.post()
-        logger.info("YooMoney notify: %s", dict(data))
-
-        check_str = "&".join([
-            data.get("notification_type", ""), data.get("operation_id", ""),
-            data.get("amount", ""), data.get("currency", ""),
-            data.get("datetime", ""), data.get("sender", ""),
-            data.get("codepro", ""), YOOMONEY_SECRET, data.get("label", ""),
-        ])
-        expected = hashlib.sha1(check_str.encode()).hexdigest()
-
-        if expected != data.get("sha1_hash", ""):
-            logger.warning("YooMoney: invalid SHA1 for label=%s", data.get("label"))
-            return web.Response(status=400, text="bad signature")
-
-        label = data.get("label", "")
-        if label in pending_payments:
-            user_id = pending_payments.pop(label)
-            score = user_scores.get(user_id, 0)
-            bot: Bot = request.app["bot"]
-            pdf_bytes = generate_report(score)
-            await bot.send_document(
-                user_id,
-                BufferedInputFile(pdf_bytes, filename="quantum_break_report.pdf"),
-                caption="█ ОПЛАТА ПОДТВЕРЖДЕНА █\n\nВаш отчёт — ниже.\nДействуйте по протоколу.",
-            )
-            logger.info("Auto-delivered report via webhook. user_id=%s score=%d", user_id, score)
-
-    except Exception as exc:
-        logger.error("YooMoney notify handler error: %s", exc)
-
-    return web.Response(status=200, text="ok")
 
 
 # ──────────────────────────────────────────────
@@ -702,7 +578,6 @@ def main() -> None:
     app.on_startup.append(on_startup)
     app.on_shutdown.append(on_shutdown)
     app.router.add_post(WEBHOOK_PATH, telegram_webhook_handler)
-    app.router.add_post(YOOMONEY_NOTIFY_PATH, yoomoney_notify_handler)
 
     logger.info("Starting on port %d", WEB_PORT)
     web.run_app(app, host="0.0.0.0", port=WEB_PORT)
