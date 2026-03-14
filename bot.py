@@ -1,6 +1,6 @@
 """
 Telegram-бот | «Квантовый разлом» — диагностический тест
-ТЕСТОВАЯ ВЕРСИЯ: PDF без оплаты
+ТЕСТОВАЯ ВЕРСИЯ: PDF без оплаты + кириллица + лоадер
 Стек: aiogram 3.x, FSM, aiohttp webhook, reportlab PDF
 """
 
@@ -8,6 +8,7 @@ import asyncio
 import logging
 import os
 import io
+import urllib.request
 
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
@@ -31,6 +32,8 @@ from reportlab.lib.units import mm
 from reportlab.lib import colors
 from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, HRFlowable
 from reportlab.lib.enums import TA_CENTER, TA_JUSTIFY
+from reportlab.pdfbase import pdfmetrics
+from reportlab.pdfbase.ttfonts import TTFont
 
 # ──────────────────────────────────────────────
 # КОНФИГУРАЦИЯ
@@ -52,13 +55,65 @@ logging.basicConfig(
 logger = logging.getLogger("quantum_bot")
 
 # ──────────────────────────────────────────────
+# ШРИФТЫ — регистрируем кириллицу
+# Ищем системные TTF, либо скачиваем DejaVu как fallback
+# ──────────────────────────────────────────────
+FONT_REGULAR = "CyrRegular"
+FONT_BOLD    = "CyrBold"
+
+def _register_fonts() -> None:
+    """
+    Пробуем найти шрифт с кириллицей в типичных системных путях.
+    Порядок приоритетов:
+      1. DejaVu (почти всегда есть на Linux)
+      2. Liberation Sans (CentOS / RHEL)
+      3. Ubuntu font
+      4. Скачиваем DejaVu во временную директорию как крайний fallback
+    """
+    candidates = [
+        ("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+         "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"),
+        ("/usr/share/fonts/dejavu/DejaVuSans.ttf",
+         "/usr/share/fonts/dejavu/DejaVuSans-Bold.ttf"),
+        ("/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+         "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf"),
+        ("/usr/share/fonts/liberation/LiberationSans-Regular.ttf",
+         "/usr/share/fonts/liberation/LiberationSans-Bold.ttf"),
+        ("/usr/share/fonts/truetype/ubuntu/Ubuntu-R.ttf",
+         "/usr/share/fonts/truetype/ubuntu/Ubuntu-B.ttf"),
+    ]
+
+    for reg, bold in candidates:
+        if os.path.exists(reg) and os.path.exists(bold):
+            pdfmetrics.registerFont(TTFont(FONT_REGULAR, reg))
+            pdfmetrics.registerFont(TTFont(FONT_BOLD, bold))
+            logger.info("Fonts loaded: %s / %s", reg, bold)
+            return
+
+    # Fallback — скачиваем DejaVu
+    logger.warning("System fonts not found, downloading DejaVu as fallback...")
+    tmp = "/tmp"
+    reg_url  = "https://github.com/dejavu-fonts/dejavu-fonts/raw/master/ttf/DejaVuSans.ttf"
+    bold_url = "https://github.com/dejavu-fonts/dejavu-fonts/raw/master/ttf/DejaVuSans-Bold.ttf"
+    reg_path  = os.path.join(tmp, "DejaVuSans.ttf")
+    bold_path = os.path.join(tmp, "DejaVuSans-Bold.ttf")
+    try:
+        urllib.request.urlretrieve(reg_url, reg_path)
+        urllib.request.urlretrieve(bold_url, bold_path)
+        pdfmetrics.registerFont(TTFont(FONT_REGULAR, reg_path))
+        pdfmetrics.registerFont(TTFont(FONT_BOLD, bold_path))
+        logger.info("DejaVu fonts downloaded and registered.")
+    except Exception as exc:
+        logger.error("Font download failed: %s — PDF will have broken cyrillic!", exc)
+        global FONT_REGULAR, FONT_BOLD
+        FONT_REGULAR = "Helvetica"
+        FONT_BOLD    = "Helvetica-Bold"
+
+
+_register_fonts()
+
+# ──────────────────────────────────────────────
 # ВОПРОСЫ ТЕСТА
-# Баллы: А=4, Б=3, В=2, Г=1  |  Итого: 5–20
-# 5–8   → Тип I    (Устойчивость)
-# 9–12  → Тип II   (Фоновое напряжение)
-# 13–15 → Тип III  (Системная перегрузка)
-# 16–18 → Тип IV   (Критическое истощение)
-# 19–20 → Тип V    (Точка разрыва)
 # ──────────────────────────────────────────────
 QUESTIONS: list[dict] = [
     {
@@ -140,13 +195,40 @@ QUESTIONS: list[dict] = [
 # FSM
 # ──────────────────────────────────────────────
 class TestState(StatesGroup):
-    answering = State()
+    answering  = State()
+    generating = State()
 
 
 # ══════════════════════════════════════════════
-# PDF ГЕНЕРАТОР — 5 вариантов отчётов
+# ЛОАДЕР
 # ══════════════════════════════════════════════
+LOADER_STEPS = [
+    ("▓░░░░░░░░░  10%", "Считываю паттерны..."),
+    ("▓▓▓░░░░░░░  30%", "Анализирую векторы нагрузки..."),
+    ("▓▓▓▓▓░░░░░  50%", "Сопоставляю профиль..."),
+    ("▓▓▓▓▓▓▓░░░  70%", "Формирую протокол..."),
+    ("▓▓▓▓▓▓▓▓▓░  90%", "Генерирую отчёт..."),
+    ("▓▓▓▓▓▓▓▓▓▓ 100%", "Готово."),
+]
 
+async def show_loader(message: Message, verdict_text: str) -> None:
+    for bar, status in LOADER_STEPS:
+        text = (
+            f"{verdict_text}\n\n"
+            "──────────────────────\n"
+            f"<code>{bar}</code>\n"
+            f"<i>{status}</i>"
+        )
+        try:
+            await message.edit_text(text)
+        except Exception:
+            pass
+        await asyncio.sleep(0.9)
+
+
+# ══════════════════════════════════════════════
+# PDF ГЕНЕРАТОР
+# ══════════════════════════════════════════════
 COLOR_ACCENT = colors.HexColor("#C8A96E")
 COLOR_TEXT   = colors.HexColor("#1A1A1A")
 COLOR_MUTED  = colors.HexColor("#666666")
@@ -156,30 +238,30 @@ COLOR_LINE   = colors.HexColor("#C8A96E")
 def _styles() -> dict:
     return {
         "title": ParagraphStyle(
-            "title", fontName="Helvetica-Bold", fontSize=20,
+            "title", fontName=FONT_BOLD, fontSize=20,
             textColor=COLOR_ACCENT, alignment=TA_CENTER,
             spaceAfter=4, leading=26,
         ),
         "subtitle": ParagraphStyle(
-            "subtitle", fontName="Helvetica", fontSize=10,
+            "subtitle", fontName=FONT_REGULAR, fontSize=10,
             textColor=COLOR_MUTED, alignment=TA_CENTER, spaceAfter=4,
         ),
         "section": ParagraphStyle(
-            "section", fontName="Helvetica-Bold", fontSize=12,
+            "section", fontName=FONT_BOLD, fontSize=12,
             textColor=COLOR_ACCENT, spaceAfter=3, spaceBefore=10,
         ),
         "body": ParagraphStyle(
-            "body", fontName="Helvetica", fontSize=10,
+            "body", fontName=FONT_REGULAR, fontSize=10,
             textColor=COLOR_TEXT, alignment=TA_JUSTIFY,
             spaceAfter=5, leading=15,
         ),
         "bullet": ParagraphStyle(
-            "bullet", fontName="Helvetica", fontSize=10,
+            "bullet", fontName=FONT_REGULAR, fontSize=10,
             textColor=COLOR_TEXT, leftIndent=10,
             spaceAfter=3, leading=14,
         ),
         "footer": ParagraphStyle(
-            "footer", fontName="Helvetica", fontSize=8,
+            "footer", fontName=FONT_REGULAR, fontSize=8,
             textColor=COLOR_MUTED, alignment=TA_CENTER,
         ),
     }
@@ -224,8 +306,6 @@ def _build_pdf(title: str, score: int, type_label: str, sections: list[dict]) ->
 
 
 def generate_report(score: int) -> bytes:
-    """Генерирует один из 5 PDF-отчётов в зависимости от балла."""
-
     if score <= 8:
         return _build_pdf("ПРОФИЛЬ: УСТОЙЧИВОСТЬ", score, "Тип I — Интегрированный", [
             {"heading": "01 / ОБЩАЯ КАРТИНА", "paragraphs": [
@@ -423,35 +503,20 @@ def build_question_keyboard(q_index: int) -> InlineKeyboardMarkup:
 
 def get_verdict(score: int) -> str:
     if score <= 8:
-        label, desc = "ТИП I — УСТОЙЧИВОСТЬ", (
-            "Система интегрирована. Паттерны осознаны. Ресурс доступен.\n"
-            "Вектор — расширение.\n\n"
-            "Генерирую персональный отчёт..."
-        )
+        label = "ТИП I — УСТОЙЧИВОСТЬ"
+        desc  = "Система интегрирована. Паттерны осознаны. Ресурс доступен.\nВектор — расширение."
     elif score <= 12:
-        label, desc = "ТИП II — ФОНОВОЕ НАПРЯЖЕНИЕ", (
-            "Адаптация работает — но стоит ресурса.\n"
-            "Система стабильна, движение — затруднено.\n\n"
-            "Генерирую персональный отчёт..."
-        )
+        label = "ТИП II — ФОНОВОЕ НАПРЯЖЕНИЕ"
+        desc  = "Адаптация работает — но стоит ресурса.\nСистема стабильна, движение — затруднено."
     elif score <= 15:
-        label, desc = "ТИП III — СИСТЕМНАЯ ПЕРЕГРУЗКА", (
-            "Компенсация на пределе. Стабильность — иллюзия.\n"
-            "Разрыв между внешним и внутренним — значительный.\n\n"
-            "Генерирую персональный отчёт..."
-        )
+        label = "ТИП III — СИСТЕМНАЯ ПЕРЕГРУЗКА"
+        desc  = "Компенсация на пределе. Стабильность — иллюзия.\nРазрыв между внешним и внутренним — значительный."
     elif score <= 18:
-        label, desc = "ТИП IV — КРИТИЧЕСКОЕ ИСТОЩЕНИЕ", (
-            "Механизмы адаптации исчерпаны.\n"
-            "Система держится на инерции и волевом контроле.\n\n"
-            "Генерирую персональный отчёт..."
-        )
+        label = "ТИП IV — КРИТИЧЕСКОЕ ИСТОЩЕНИЕ"
+        desc  = "Механизмы адаптации исчерпаны.\nСистема держится на инерции и волевом контроле."
     else:
-        label, desc = "ТИП V — ТОЧКА РАЗРЫВА", (
-            "Максимальный индекс нагрузки по всем векторам.\n"
-            "Старая система больше не функционирует.\n\n"
-            "Генерирую персональный отчёт..."
-        )
+        label = "ТИП V — ТОЧКА РАЗРЫВА"
+        desc  = "Максимальный индекс нагрузки по всем векторам.\nСтарая система больше не функционирует."
     return f"░░ ВЕРДИКТ: {label} ░░\n\n{desc}"
 
 
@@ -512,17 +577,33 @@ async def cb_answer(callback: CallbackQuery, state: FSMContext) -> None:
             QUESTIONS[next_q]["text"],
             reply_markup=build_question_keyboard(next_q),
         )
+        await callback.answer()
     else:
-        # ── ТЕСТОВЫЙ РЕЖИМ: PDF без оплаты ──
-        await callback.message.edit_text(get_verdict(new_score))
-        await deliver_report(callback.message, new_score, state)
+        # Последний вопрос — запускаем лоадер
+        await callback.answer()
+        await state.set_state(TestState.generating)
+        await state.update_data(score=new_score)
 
-    await callback.answer()
+        verdict = get_verdict(new_score)
+
+        # Убираем кнопки, показываем вердикт + стартовый бар
+        await callback.message.edit_text(
+            f"{verdict}\n\n──────────────────────\n"
+            f"<code>░░░░░░░░░░   0%</code>\n<i>Инициализация...</i>"
+        )
+
+        # Анимация загрузки
+        await show_loader(callback.message, verdict)
+
+        # Генерируем PDF в отдельном потоке (не блокируем event loop)
+        await deliver_report(callback.message, new_score, state)
 
 
 async def deliver_report(message: Message, score: int, state: FSMContext) -> None:
     try:
-        pdf_bytes = generate_report(score)
+        pdf_bytes = await asyncio.get_event_loop().run_in_executor(
+            None, generate_report, score
+        )
         await message.answer_document(
             BufferedInputFile(pdf_bytes, filename="quantum_break_report.pdf"),
             caption=(
