@@ -1,6 +1,6 @@
 """
 Telegram-бот | «Квантовый разлом» — диагностический тест
-ТЕСТОВАЯ ВЕРСИЯ: PDF без оплаты + кириллица + лоадер
+ТЕСТОВАЯ ВЕРСИЯ: PDF без оплаты + кириллица + лоадер параллельно с генерацией
 Стек: aiogram 3.x, FSM, aiohttp webhook, reportlab PDF
 """
 
@@ -56,21 +56,14 @@ logger = logging.getLogger("quantum_bot")
 
 # ──────────────────────────────────────────────
 # ШРИФТЫ — регистрируем кириллицу
-# Ищем системные TTF, либо скачиваем DejaVu как fallback
 # ──────────────────────────────────────────────
 FONT_REGULAR = "CyrRegular"
 FONT_BOLD    = "CyrBold"
 
+
 def _register_fonts() -> None:
-    """
-    Пробуем найти шрифт с кириллицей в типичных системных путях.
-    Порядок приоритетов:
-      1. DejaVu (почти всегда есть на Linux)
-      2. Liberation Sans (CentOS / RHEL)
-      3. Ubuntu font
-      4. Скачиваем DejaVu во временную директорию как крайний fallback
-    """
-    global FONT_REGULAR, FONT_BOLD
+    global FONT_REGULAR, FONT_BOLD  # <-- объявляем первым делом
+
     candidates = [
         ("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
          "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"),
@@ -106,7 +99,6 @@ def _register_fonts() -> None:
         logger.info("DejaVu fonts downloaded and registered.")
     except Exception as exc:
         logger.error("Font download failed: %s — PDF will have broken cyrillic!", exc)
-        global FONT_REGULAR, FONT_BOLD
         FONT_REGULAR = "Helvetica"
         FONT_BOLD    = "Helvetica-Bold"
 
@@ -212,7 +204,9 @@ LOADER_STEPS = [
     ("▓▓▓▓▓▓▓▓▓▓ 100%", "Готово."),
 ]
 
+
 async def show_loader(message: Message, verdict_text: str) -> None:
+    """Анимирует прогресс-бар, редактируя сообщение."""
     for bar, status in LOADER_STEPS:
         text = (
             f"{verdict_text}\n\n"
@@ -579,33 +573,34 @@ async def cb_answer(callback: CallbackQuery, state: FSMContext) -> None:
             reply_markup=build_question_keyboard(next_q),
         )
         await callback.answer()
-    else:
-        # Последний вопрос — запускаем лоадер
-        await callback.answer()
-        await state.set_state(TestState.generating)
-        await state.update_data(score=new_score)
+        return
 
-        verdict = get_verdict(new_score)
+    # ── Последний вопрос ──────────────────────
+    await callback.answer()
+    await state.set_state(TestState.generating)
+    await state.update_data(score=new_score)
 
-        # Убираем кнопки, показываем вердикт + стартовый бар
-        await callback.message.edit_text(
-            f"{verdict}\n\n──────────────────────\n"
-            f"<code>░░░░░░░░░░   0%</code>\n<i>Инициализация...</i>"
-        )
+    verdict = get_verdict(new_score)
 
-        # Анимация загрузки
-        await show_loader(callback.message, verdict)
+    # Сразу показываем вердикт + нулевой бар
+    await callback.message.edit_text(
+        f"{verdict}\n\n──────────────────────\n"
+        f"<code>░░░░░░░░░░   0%</code>\n<i>Инициализация...</i>"
+    )
 
-        # Генерируем PDF в отдельном потоке (не блокируем event loop)
-        await deliver_report(callback.message, new_score, state)
+    # Запускаем генерацию PDF и анимацию ПАРАЛЛЕЛЬНО
+    loop = asyncio.get_event_loop()
+    pdf_future = loop.run_in_executor(None, generate_report, new_score)
+    loader_task = asyncio.create_task(show_loader(callback.message, verdict))
 
+    # Ждём оба — лоадер и PDF
+    await asyncio.gather(loader_task, pdf_future)
 
-async def deliver_report(message: Message, score: int, state: FSMContext) -> None:
+    # Забираем результат PDF (уже готов)
+    pdf_bytes = await pdf_future
+
     try:
-        pdf_bytes = await asyncio.get_event_loop().run_in_executor(
-            None, generate_report, score
-        )
-        await message.answer_document(
+        await callback.message.answer_document(
             BufferedInputFile(pdf_bytes, filename="quantum_break_report.pdf"),
             caption=(
                 "█ ОТЧЁТ СФОРМИРОВАН █\n\n"
@@ -613,11 +608,11 @@ async def deliver_report(message: Message, score: int, state: FSMContext) -> Non
                 "Система не ждёт — но и не торопит."
             ),
         )
-        logger.info("Report delivered. Score=%d", score)
+        logger.info("Report delivered. Score=%d", new_score)
         await state.clear()
     except Exception as exc:
-        logger.error("Failed to generate/send PDF: %s", exc)
-        await message.answer("Ошибка при генерации отчёта. Свяжитесь с поддержкой.")
+        logger.error("Failed to send PDF: %s", exc)
+        await callback.message.answer("Ошибка при отправке отчёта. Свяжитесь с поддержкой.")
 
 
 # ──────────────────────────────────────────────
