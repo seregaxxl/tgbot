@@ -70,6 +70,7 @@ def _register_fonts() -> None:
       3. Ubuntu font
       4. Скачиваем DejaVu во временную директорию как крайний fallback
     """
+    global FONT_REGULAR, FONT_BOLD
     candidates = [
         ("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
          "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"),
