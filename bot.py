@@ -26,6 +26,7 @@ from aiogram.types import (
     Message,
 )
 from aiohttp import web
+from yoomoney import Client, Quickpay
 
 from reportlab.lib.pagesizes import A4
 from reportlab.lib.styles import ParagraphStyle
@@ -44,6 +45,13 @@ WEBHOOK_HOST: str = os.getenv("WEBHOOK_HOST", "https://yourdomain.com")
 WEBHOOK_PATH: str = "/webhook/telegram"
 WEBHOOK_URL: str = f"{WEBHOOK_HOST}{WEBHOOK_PATH}"
 WEB_PORT: int = int(os.getenv("PORT", 8080))
+
+YOOMONEY_TOKEN: str  = os.getenv("YOOMONEY_TOKEN", "YOUR_YOOMONEY_TOKEN")
+YOOMONEY_WALLET: str = os.getenv("YOOMONEY_WALLET", "YOUR_WALLET_NUMBER")
+YOOMONEY_SECRET: str = os.getenv("YOOMONEY_SECRET", "YOUR_YOOMONEY_SECRET")
+YOOMONEY_NOTIFY_PATH: str = "/webhook/yoomoney"
+PAYMENT_AMOUNT: float = 1.0          # ← 1 рубль для теста, потом сменить на 390.0
+PAYMENT_LABEL_PREFIX: str = "report_"
 
 # Пути к картинкам (положите файлы в assets/ рядом с bot.py)
 # assets/start.jpg       — экран приветствия
@@ -120,6 +128,9 @@ def _register_fonts() -> None:
 
 
 _register_fonts()
+
+pending_payments: dict[str, int] = {}
+user_scores: dict[int, int] = {}
 
 # ──────────────────────────────────────────────
 # ВОПРОСЫ ТЕСТА
@@ -204,8 +215,9 @@ QUESTIONS: list[dict] = [
 # FSM
 # ──────────────────────────────────────────────
 class TestState(StatesGroup):
-    answering  = State()
-    generating = State()
+    answering        = State()
+    generating       = State()
+    awaiting_payment = State()
 
 
 # ══════════════════════════════════════════════
@@ -534,6 +546,43 @@ def get_verdict(score: int) -> str:
 # ──────────────────────────────────────────────
 # РОУТЕР И ХЭНДЛЕРЫ
 # ──────────────────────────────────────────────
+def create_payment_link(user_id: int, score: int) -> tuple[str, str]:
+    import uuid
+    label = f"{PAYMENT_LABEL_PREFIX}{user_id}_{uuid.uuid4().hex[:8]}"
+    quickpay = Quickpay(
+        receiver=YOOMONEY_WALLET,
+        quickpay_form="shop",
+        targets=f"Доступ к отчёту QuanTum Break (score={score})",
+        paymentType="SB",
+        sum=PAYMENT_AMOUNT,
+        label=label,
+    )
+    return quickpay.base_url, label
+
+
+def verify_payment(label: str) -> bool:
+    try:
+        client = Client(YOOMONEY_TOKEN)
+        history = client.operation_history(label=label)
+        for op in history.operations:
+            if op.label == label and op.status == "success" and float(op.amount) >= PAYMENT_AMOUNT:
+                return True
+    except Exception as exc:
+        logger.error("YooMoney history check failed: %s", exc)
+    return False
+
+
+def build_payment_keyboard(pay_url: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(
+            text=f"💳 Оплатить {int(PAYMENT_AMOUNT)} руб  [тест]" if PAYMENT_AMOUNT <= 10
+                 else f"💳 Оплатить доступ  {int(PAYMENT_AMOUNT)} руб  [было 690 руб]",
+            url=pay_url,
+        )],
+        [InlineKeyboardButton(text="🔄 Проверить оплату", callback_data="check_payment")],
+    ])
+
+
 router = Router()
 
 
@@ -636,26 +685,76 @@ async def cb_answer(callback: CallbackQuery, state: FSMContext) -> None:
     # ШАГ 3: анимируем лоадер (параллельно с генерацией в фоне)
     await show_loader(loader_msg, verdict)
 
-    # ШАГ 4: лоадер закончился — ждём PDF если ещё не готов
-    pdf_bytes = await pdf_future
+    # ШАГ 4: лоадер закончился — ждём PDF (уже готов в фоне)
+    await pdf_future  # убеждаемся что генерация завершена без ошибок
+
+    user_id = callback.from_user.id
+    user_scores[user_id] = new_score
 
     try:
-        await loader_msg.answer_document(
+        pay_url, label = create_payment_link(user_id, new_score)
+        pending_payments[label] = user_id
+        await state.update_data(payment_label=label)
+        await state.set_state(TestState.awaiting_payment)
+
+        # Финальная картинка + кнопка оплаты
+        verdict_short = get_verdict(new_score)
+        pay_caption = (
+            f"{verdict_short}\n\n"
+            "──────────────────────\n"
+            "Полный отчёт с протоколом действий <b>заблокирован</b>.\n"
+            "Для разблокировки — произведите оплату."
+        )
+        if os.path.exists(IMG_FINAL):
+            await loader_msg.answer_photo(
+                photo=FSInputFile(IMG_FINAL),
+                caption=pay_caption,
+                reply_markup=build_payment_keyboard(pay_url),
+            )
+        else:
+            await loader_msg.answer(pay_caption, reply_markup=build_payment_keyboard(pay_url))
+
+    except Exception as exc:
+        logger.error("Payment link creation failed for user %s: %s", callback.from_user.id, exc)
+        await loader_msg.answer("Система временно недоступна. Попробуйте /start")
+
+
+@router.callback_query(StateFilter(TestState.awaiting_payment), F.data == "check_payment")
+async def cb_check_payment(callback: CallbackQuery, state: FSMContext) -> None:
+    data = await state.get_data()
+    label: str | None = data.get("payment_label")
+    score: int = data.get("score", 0)
+
+    if not label:
+        await callback.answer("Данные платежа не найдены. Пройдите тест заново.", show_alert=True)
+        return
+
+    await callback.answer("Проверяю платёж…")
+    paid = await asyncio.get_event_loop().run_in_executor(None, verify_payment, label)
+    if paid:
+        await deliver_report(callback.message, score, state)
+    else:
+        await callback.message.answer(
+            "░ Оплата пока не зафиксирована.\nПосле оплаты нажмите «Проверить оплату» повторно."
+        )
+
+
+async def deliver_report(message: Message, score: int, state: FSMContext) -> None:
+    try:
+        pdf_bytes = await asyncio.get_event_loop().run_in_executor(None, generate_report, score)
+        await message.answer_document(
             BufferedInputFile(pdf_bytes, filename="quantum_break_report.pdf"),
             caption=(
-                "█ ОТЧЁТ СФОРМИРОВАН █\n\n"
+                "█ ОТЧЁТ РАЗБЛОКИРОВАН █\n\n"
                 "Изучите протокол. Следуйте инструкциям.\n"
                 "Система не ждёт — но и не торопит."
             ),
         )
-        # Финальная картинка после PDF
-        if os.path.exists(IMG_FINAL):
-            await loader_msg.answer_photo(photo=FSInputFile(IMG_FINAL))
-        logger.info("Report delivered. Score=%d", new_score)
+        logger.info("Report delivered after payment. Score=%d", score)
         await state.clear()
     except Exception as exc:
-        logger.error("Failed to send PDF: %s", exc)
-        await loader_msg.answer("Ошибка при отправке отчёта. Свяжитесь с поддержкой.")
+        logger.error("Failed to generate/send PDF: %s", exc)
+        await message.answer("Ошибка при генерации отчёта. Свяжитесь с поддержкой.")
 
 
 # ──────────────────────────────────────────────
@@ -671,6 +770,42 @@ async def telegram_webhook_handler(request: web.Request) -> web.Response:
     except Exception as exc:
         logger.error("Telegram webhook error: %s", exc)
     return web.Response(status=200)
+
+
+import hashlib
+
+async def yoomoney_notify_handler(request: web.Request) -> web.Response:
+    try:
+        data = await request.post()
+        logger.info("YooMoney notify: %s", dict(data))
+
+        check_str = "&".join([
+            data.get("notification_type", ""), data.get("operation_id", ""),
+            data.get("amount", ""),            data.get("currency", ""),
+            data.get("datetime", ""),          data.get("sender", ""),
+            data.get("codepro", ""),           YOOMONEY_SECRET,
+            data.get("label", ""),
+        ])
+        expected = hashlib.sha1(check_str.encode()).hexdigest()
+        if expected != data.get("sha1_hash", ""):
+            logger.warning("YooMoney: invalid SHA1 for label=%s", data.get("label"))
+            return web.Response(status=400, text="bad signature")
+
+        label = data.get("label", "")
+        if label in pending_payments:
+            user_id = pending_payments.pop(label)
+            score   = user_scores.get(user_id, 0)
+            bot: Bot = request.app["bot"]
+            pdf_bytes = generate_report(score)
+            await bot.send_document(
+                user_id,
+                BufferedInputFile(pdf_bytes, filename="quantum_break_report.pdf"),
+                caption="█ ОПЛАТА ПОДТВЕРЖДЕНА █\n\nВаш отчёт — ниже.\nДействуйте по протоколу.",
+            )
+            logger.info("Auto-delivered via webhook. user_id=%s score=%d", user_id, score)
+    except Exception as exc:
+        logger.error("YooMoney notify handler error: %s", exc)
+    return web.Response(status=200, text="ok")
 
 
 async def on_startup(app: web.Application) -> None:
@@ -698,6 +833,7 @@ def main() -> None:
     app.on_startup.append(on_startup)
     app.on_shutdown.append(on_shutdown)
     app.router.add_post(WEBHOOK_PATH, telegram_webhook_handler)
+    app.router.add_post(YOOMONEY_NOTIFY_PATH, yoomoney_notify_handler)
 
     logger.info("Starting on port %d", WEB_PORT)
     web.run_app(app, host="0.0.0.0", port=WEB_PORT)
