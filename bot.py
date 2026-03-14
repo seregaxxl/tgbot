@@ -20,6 +20,7 @@ from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import (
     BufferedInputFile,
     CallbackQuery,
+    FSInputFile,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     Message,
@@ -43,6 +44,21 @@ WEBHOOK_HOST: str = os.getenv("WEBHOOK_HOST", "https://yourdomain.com")
 WEBHOOK_PATH: str = "/webhook/telegram"
 WEBHOOK_URL: str = f"{WEBHOOK_HOST}{WEBHOOK_PATH}"
 WEB_PORT: int = int(os.getenv("PORT", 8080))
+
+# Пути к картинкам (положите файлы в assets/ рядом с bot.py)
+# assets/start.jpg       — экран приветствия
+# assets/q1.jpg          — вопрос 1
+# assets/q2.jpg          — вопрос 2
+# assets/q3.jpg          — вопрос 3
+# assets/q4.jpg          — вопрос 4
+# assets/q5.jpg          — вопрос 5
+# assets/final.jpg       — экран после PDF
+BASE_DIR: str = os.path.dirname(os.path.abspath(__file__))
+IMG_START:  str = os.path.join(BASE_DIR, "assets", "start.jpg")
+IMG_FINAL:  str = os.path.join(BASE_DIR, "assets", "final.jpg")
+IMG_QUESTIONS: list[str] = [
+    os.path.join(BASE_DIR, "assets", f"q{i}.jpg") for i in range(1, 6)
+]
 
 # ──────────────────────────────────────────────
 # ЛОГИРОВАНИЕ
@@ -521,31 +537,56 @@ def get_verdict(score: int) -> str:
 router = Router()
 
 
+async def send_question(target: Message, q_index: int, prev_message: Message | None = None) -> Message:
+    """Отправляет вопрос с картинкой (или редактирует текст если картинки нет).
+    Возвращает новое сообщение чтобы сохранить его id для последующего удаления."""
+    text = QUESTIONS[q_index]["text"]
+    kb   = build_question_keyboard(q_index)
+    img  = IMG_QUESTIONS[q_index]
+
+    if os.path.exists(img):
+        # Удаляем предыдущее сообщение и отправляем новое с фото
+        if prev_message:
+            try:
+                await prev_message.delete()
+            except Exception:
+                pass
+        return await target.answer_photo(photo=FSInputFile(img), caption=text, reply_markup=kb)
+    else:
+        # Нет картинки — просто редактируем текущее сообщение
+        if prev_message:
+            await prev_message.edit_text(text, reply_markup=kb)
+            return prev_message
+        return await target.answer(text, reply_markup=kb)
+
+
 @router.message(Command("start"))
 async def cmd_start(message: Message, state: FSMContext) -> None:
     await state.clear()
-    await message.answer(
+    text = (
         "█ СИСТЕМА ИНИЦИАЛИЗИРОВАНА █\n\n"
         "Добро пожаловать в диагностический модуль <b>Квантового Разлома</b>.\n\n"
         "Перед вами — 5 вопросов.\n"
         "Нет правильных ответов. Есть только ваши.\n\n"
         "Результат: персональный отчёт с профилем и протоколом действий.\n\n"
-        "Готовы к диагнозу?",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="▶ Начать тест", callback_data="start_test")]
-        ]),
+        "Готовы к диагнозу?"
     )
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="▶ Начать тест", callback_data="start_test")]
+    ])
+    if os.path.exists(IMG_START):
+        await message.answer_photo(photo=FSInputFile(IMG_START), caption=text, reply_markup=kb)
+    else:
+        await message.answer(text, reply_markup=kb)
 
 
 @router.callback_query(F.data == "start_test")
 async def cb_start_test(callback: CallbackQuery, state: FSMContext) -> None:
     await state.set_state(TestState.answering)
     await state.update_data(q_index=0, score=0)
-    await callback.message.edit_text(
-        QUESTIONS[0]["text"],
-        reply_markup=build_question_keyboard(0),
-    )
     await callback.answer()
+    new_msg = await send_question(callback.message, 0, prev_message=callback.message)
+    await state.update_data(last_msg_id=new_msg.message_id)
 
 
 @router.callback_query(StateFilter(TestState.answering), F.data.startswith("ans:"))
@@ -568,11 +609,9 @@ async def cb_answer(callback: CallbackQuery, state: FSMContext) -> None:
 
     if next_q < len(QUESTIONS):
         await state.update_data(q_index=next_q, score=new_score)
-        await callback.message.edit_text(
-            QUESTIONS[next_q]["text"],
-            reply_markup=build_question_keyboard(next_q),
-        )
         await callback.answer()
+        new_msg = await send_question(callback.message, next_q, prev_message=callback.message)
+        await state.update_data(last_msg_id=new_msg.message_id)
         return
 
     # ── Последний вопрос ──────────────────────
@@ -582,25 +621,28 @@ async def cb_answer(callback: CallbackQuery, state: FSMContext) -> None:
 
     verdict = get_verdict(new_score)
 
-    # Сразу показываем вердикт + нулевой бар
-    await callback.message.edit_text(
+    # ШАГ 1: удаляем сообщение с вопросом, отправляем лоадер новым сообщением
+    try:
+        await callback.message.delete()
+    except Exception:
+        pass
+    loader_msg = await callback.message.answer(
         f"{verdict}\n\n──────────────────────\n"
         f"<code>░░░░░░░░░░   0%</code>\n<i>Инициализация...</i>"
     )
 
-    # Запускаем генерацию PDF и анимацию ПАРАЛЛЕЛЬНО
+    # ШАГ 2: только ПОСЛЕ того как экран отрисован — запускаем генерацию PDF в фоне
     loop = asyncio.get_event_loop()
     pdf_future = loop.run_in_executor(None, generate_report, new_score)
-    loader_task = asyncio.create_task(show_loader(callback.message, verdict))
 
-    # Ждём оба — лоадер и PDF
-    await asyncio.gather(loader_task, pdf_future)
+    # ШАГ 3: анимируем лоадер (параллельно с генерацией в фоне)
+    await show_loader(loader_msg, verdict)
 
-    # Забираем результат PDF (уже готов)
+    # ШАГ 4: лоадер закончился — ждём PDF если ещё не готов
     pdf_bytes = await pdf_future
 
     try:
-        await callback.message.answer_document(
+        await loader_msg.answer_document(
             BufferedInputFile(pdf_bytes, filename="quantum_break_report.pdf"),
             caption=(
                 "█ ОТЧЁТ СФОРМИРОВАН █\n\n"
@@ -608,11 +650,14 @@ async def cb_answer(callback: CallbackQuery, state: FSMContext) -> None:
                 "Система не ждёт — но и не торопит."
             ),
         )
+        # Финальная картинка после PDF
+        if os.path.exists(IMG_FINAL):
+            await loader_msg.answer_photo(photo=FSInputFile(IMG_FINAL))
         logger.info("Report delivered. Score=%d", new_score)
         await state.clear()
     except Exception as exc:
         logger.error("Failed to send PDF: %s", exc)
-        await callback.message.answer("Ошибка при отправке отчёта. Свяжитесь с поддержкой.")
+        await loader_msg.answer("Ошибка при отправке отчёта. Свяжитесь с поддержкой.")
 
 
 # ──────────────────────────────────────────────
