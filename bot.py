@@ -538,25 +538,23 @@ router = Router()
 
 
 async def send_question(target: Message, q_index: int, prev_message: Message | None = None) -> Message:
-    """Отправляет вопрос с картинкой (или редактирует текст если картинки нет).
-    Возвращает новое сообщение чтобы сохранить его id для последующего удаления."""
+    """Отправляет вопрос новым сообщением, предыдущее удаляет.
+    Возвращает новое сообщение для последующего удаления."""
     text = QUESTIONS[q_index]["text"]
     kb   = build_question_keyboard(q_index)
     img  = IMG_QUESTIONS[q_index]
 
+    # Всегда удаляем предыдущее сообщение
+    if prev_message:
+        try:
+            await prev_message.delete()
+        except Exception:
+            pass
+
+    # Отправляем новое — с картинкой или без
     if os.path.exists(img):
-        # Удаляем предыдущее сообщение и отправляем новое с фото
-        if prev_message:
-            try:
-                await prev_message.delete()
-            except Exception:
-                pass
         return await target.answer_photo(photo=FSInputFile(img), caption=text, reply_markup=kb)
     else:
-        # Нет картинки — просто редактируем текущее сообщение
-        if prev_message:
-            await prev_message.edit_text(text, reply_markup=kb)
-            return prev_message
         return await target.answer(text, reply_markup=kb)
 
 
