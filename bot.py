@@ -55,9 +55,9 @@ WEB_PORT: int = int(os.getenv("PORT", 8080))
 # assets/final.jpg       — экран после PDF
 BASE_DIR: str = os.path.dirname(os.path.abspath(__file__))
 IMG_START:  str = os.path.join(BASE_DIR, "assets", "start.jpg")
-IMG_FINAL:  str = os.path.join(BASE_DIR, "assets", "final.jpg")
+IMG_FINAL:  str = os.path.join(BASE_DIR, "assets", "final.png")
 IMG_QUESTIONS: list[str] = [
-    os.path.join(BASE_DIR, "assets", f"q{i}.jpg") for i in range(1, 6)
+    os.path.join(BASE_DIR, "assets", f"q{i}.png") for i in range(1, 6)
 ]
 
 # ──────────────────────────────────────────────
