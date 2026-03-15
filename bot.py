@@ -1,15 +1,14 @@
 """
 Telegram-бот | «Квантовый разлом» — диагностический тест
-Стек: aiogram 3.x, FSM, YooMoney, aiohttp webhook, reportlab PDF
+ТЕСТОВАЯ ВЕРСИЯ: PDF без оплаты + кириллица + лоадер параллельно с генерацией
+Стек: aiogram 3.x, FSM, aiohttp webhook, reportlab PDF
 """
 
 import asyncio
-import hashlib
 import logging
 import os
-import uuid
 import io
-from typing import Optional
+import urllib.request
 
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
@@ -21,6 +20,7 @@ from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import (
     BufferedInputFile,
     CallbackQuery,
+    FSInputFile,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     Message,
@@ -34,22 +34,39 @@ from reportlab.lib.units import mm
 from reportlab.lib import colors
 from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, HRFlowable
 from reportlab.lib.enums import TA_CENTER, TA_JUSTIFY
+from reportlab.pdfbase import pdfmetrics
+from reportlab.pdfbase.ttfonts import TTFont
 
 # ──────────────────────────────────────────────
 # КОНФИГУРАЦИЯ
 # ──────────────────────────────────────────────
 BOT_TOKEN: str = os.getenv("BOT_TOKEN", "REPLACE_WITH_NEW_TOKEN")
-YOOMONEY_TOKEN: str = os.getenv("YOOMONEY_TOKEN", "YOUR_YOOMONEY_TOKEN")
-YOOMONEY_WALLET: str = os.getenv("YOOMONEY_WALLET", "YOUR_WALLET_NUMBER")
-YOOMONEY_SECRET: str = os.getenv("YOOMONEY_SECRET", "YOUR_YOOMONEY_SECRET")
 WEBHOOK_HOST: str = os.getenv("WEBHOOK_HOST", "https://yourdomain.com")
 WEBHOOK_PATH: str = "/webhook/telegram"
 WEBHOOK_URL: str = f"{WEBHOOK_HOST}{WEBHOOK_PATH}"
-YOOMONEY_NOTIFY_PATH: str = "/webhook/yoomoney"
 WEB_PORT: int = int(os.getenv("PORT", 8080))
 
-PAYMENT_AMOUNT: float = 390.0
+YOOMONEY_TOKEN: str  = os.getenv("YOOMONEY_TOKEN", "YOUR_YOOMONEY_TOKEN")
+YOOMONEY_WALLET: str = os.getenv("YOOMONEY_WALLET", "YOUR_WALLET_NUMBER")
+YOOMONEY_SECRET: str = os.getenv("YOOMONEY_SECRET", "YOUR_YOOMONEY_SECRET")
+YOOMONEY_NOTIFY_PATH: str = "/webhook/yoomoney"
+PAYMENT_AMOUNT: float = 1.0          # ← 1 рубль для теста, потом сменить на 390.0
 PAYMENT_LABEL_PREFIX: str = "report_"
+
+# Пути к картинкам (положите файлы в assets/ рядом с bot.py)
+# assets/start.jpg       — экран приветствия
+# assets/q1.jpg          — вопрос 1
+# assets/q2.jpg          — вопрос 2
+# assets/q3.jpg          — вопрос 3
+# assets/q4.jpg          — вопрос 4
+# assets/q5.jpg          — вопрос 5
+# assets/final.jpg       — экран после PDF
+BASE_DIR: str = os.path.dirname(os.path.abspath(__file__))
+IMG_START:  str = os.path.join(BASE_DIR, "assets", "start.jpg")
+IMG_FINAL:  str = os.path.join(BASE_DIR, "assets", "final.png")
+IMG_QUESTIONS: list[str] = [
+    os.path.join(BASE_DIR, "assets", f"q{i}.png") for i in range(1, 6)
+]
 
 # ──────────────────────────────────────────────
 # ЛОГИРОВАНИЕ
@@ -62,13 +79,80 @@ logging.basicConfig(
 logger = logging.getLogger("quantum_bot")
 
 # ──────────────────────────────────────────────
+# ШРИФТЫ — регистрируем кириллицу
+# ──────────────────────────────────────────────
+FONT_REGULAR = "CyrRegular"
+FONT_BOLD    = "CyrBold"
+
+
+def _register_fonts() -> None:
+    global FONT_REGULAR, FONT_BOLD  # <-- объявляем первым делом
+
+    candidates = [
+        ("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+         "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"),
+        ("/usr/share/fonts/dejavu/DejaVuSans.ttf",
+         "/usr/share/fonts/dejavu/DejaVuSans-Bold.ttf"),
+        ("/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+         "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf"),
+        ("/usr/share/fonts/liberation/LiberationSans-Regular.ttf",
+         "/usr/share/fonts/liberation/LiberationSans-Bold.ttf"),
+        ("/usr/share/fonts/truetype/ubuntu/Ubuntu-R.ttf",
+         "/usr/share/fonts/truetype/ubuntu/Ubuntu-B.ttf"),
+    ]
+
+    for reg, bold in candidates:
+        if os.path.exists(reg) and os.path.exists(bold):
+            pdfmetrics.registerFont(TTFont(FONT_REGULAR, reg))
+            pdfmetrics.registerFont(TTFont(FONT_BOLD, bold))
+            logger.info("Fonts loaded: %s / %s", reg, bold)
+            return
+
+    # Fallback — скачиваем DejaVu
+    logger.warning("System fonts not found, downloading DejaVu as fallback...")
+    tmp = "/tmp"
+    reg_url  = "https://github.com/dejavu-fonts/dejavu-fonts/raw/master/ttf/DejaVuSans.ttf"
+    bold_url = "https://github.com/dejavu-fonts/dejavu-fonts/raw/master/ttf/DejaVuSans-Bold.ttf"
+    reg_path  = os.path.join(tmp, "DejaVuSans.ttf")
+    bold_path = os.path.join(tmp, "DejaVuSans-Bold.ttf")
+    try:
+        urllib.request.urlretrieve(reg_url, reg_path)
+        urllib.request.urlretrieve(bold_url, bold_path)
+        pdfmetrics.registerFont(TTFont(FONT_REGULAR, reg_path))
+        pdfmetrics.registerFont(TTFont(FONT_BOLD, bold_path))
+        logger.info("DejaVu fonts downloaded and registered.")
+    except Exception as exc:
+        logger.error("Font download failed: %s — PDF will have broken cyrillic!", exc)
+        FONT_REGULAR = "Helvetica"
+        FONT_BOLD    = "Helvetica-Bold"
+
+
+_register_fonts()
+
+import shelve
+import threading
+
+_db_lock = threading.Lock()
+DB_PATH = os.path.join(BASE_DIR, "payments_db")  # файл payments_db.db рядом с bot.py
+
+def db_set(key: str, value) -> None:
+    with _db_lock:
+        with shelve.open(DB_PATH) as db:
+            db[key] = value
+
+def db_get(key: str, default=None):
+    with _db_lock:
+        with shelve.open(DB_PATH) as db:
+            return db.get(key, default)
+
+def db_del(key: str) -> None:
+    with _db_lock:
+        with shelve.open(DB_PATH) as db:
+            if key in db:
+                del db[key]
+
+# ──────────────────────────────────────────────
 # ВОПРОСЫ ТЕСТА
-# Баллы: А=4, Б=3, В=2, Г=1  |  Итого: 5–20
-# 5–8   → Тип I    (Устойчивость)
-# 9–12  → Тип II   (Фоновое напряжение)
-# 13–15 → Тип III  (Системная перегрузка)
-# 16–18 → Тип IV   (Критическое истощение)
-# 19–20 → Тип V    (Точка разрыва)
 # ──────────────────────────────────────────────
 QUESTIONS: list[dict] = [
     {
@@ -150,18 +234,43 @@ QUESTIONS: list[dict] = [
 # FSM
 # ──────────────────────────────────────────────
 class TestState(StatesGroup):
-    answering = State()
+    answering        = State()
+    generating       = State()
     awaiting_payment = State()
 
 
-pending_payments: dict[str, int] = {}
-user_scores: dict[int, int] = {}
+# ══════════════════════════════════════════════
+# ЛОАДЕР
+# ══════════════════════════════════════════════
+LOADER_STEPS = [
+    ("▓░░░░░░░░░  10%", "Считываю паттерны..."),
+    ("▓▓▓░░░░░░░  30%", "Анализирую векторы нагрузки..."),
+    ("▓▓▓▓▓░░░░░  50%", "Сопоставляю профиль..."),
+    ("▓▓▓▓▓▓▓░░░  70%", "Формирую протокол..."),
+    ("▓▓▓▓▓▓▓▓▓░  90%", "Генерирую отчёт..."),
+    ("▓▓▓▓▓▓▓▓▓▓ 100%", "Готово."),
+]
+
+
+async def show_loader(message: Message, verdict_text: str) -> None:
+    """Анимирует прогресс-бар, редактируя сообщение."""
+    for bar, status in LOADER_STEPS:
+        text = (
+            f"{verdict_text}\n\n"
+            "──────────────────────\n"
+            f"<code>{bar}</code>\n"
+            f"<i>{status}</i>"
+        )
+        try:
+            await message.edit_text(text)
+        except Exception:
+            pass
+        await asyncio.sleep(0.9)
 
 
 # ══════════════════════════════════════════════
-# PDF ГЕНЕРАТОР — 5 вариантов отчётов
+# PDF ГЕНЕРАТОР
 # ══════════════════════════════════════════════
-
 COLOR_ACCENT = colors.HexColor("#C8A96E")
 COLOR_TEXT   = colors.HexColor("#1A1A1A")
 COLOR_MUTED  = colors.HexColor("#666666")
@@ -171,30 +280,30 @@ COLOR_LINE   = colors.HexColor("#C8A96E")
 def _styles() -> dict:
     return {
         "title": ParagraphStyle(
-            "title", fontName="Helvetica-Bold", fontSize=20,
+            "title", fontName=FONT_BOLD, fontSize=20,
             textColor=COLOR_ACCENT, alignment=TA_CENTER,
             spaceAfter=4, leading=26,
         ),
         "subtitle": ParagraphStyle(
-            "subtitle", fontName="Helvetica", fontSize=10,
+            "subtitle", fontName=FONT_REGULAR, fontSize=10,
             textColor=COLOR_MUTED, alignment=TA_CENTER, spaceAfter=4,
         ),
         "section": ParagraphStyle(
-            "section", fontName="Helvetica-Bold", fontSize=12,
+            "section", fontName=FONT_BOLD, fontSize=12,
             textColor=COLOR_ACCENT, spaceAfter=3, spaceBefore=10,
         ),
         "body": ParagraphStyle(
-            "body", fontName="Helvetica", fontSize=10,
+            "body", fontName=FONT_REGULAR, fontSize=10,
             textColor=COLOR_TEXT, alignment=TA_JUSTIFY,
             spaceAfter=5, leading=15,
         ),
         "bullet": ParagraphStyle(
-            "bullet", fontName="Helvetica", fontSize=10,
+            "bullet", fontName=FONT_REGULAR, fontSize=10,
             textColor=COLOR_TEXT, leftIndent=10,
             spaceAfter=3, leading=14,
         ),
         "footer": ParagraphStyle(
-            "footer", fontName="Helvetica", fontSize=8,
+            "footer", fontName=FONT_REGULAR, fontSize=8,
             textColor=COLOR_MUTED, alignment=TA_CENTER,
         ),
     }
@@ -239,8 +348,6 @@ def _build_pdf(title: str, score: int, type_label: str, sections: list[dict]) ->
 
 
 def generate_report(score: int) -> bytes:
-    """Генерирует один из 5 PDF-отчётов в зависимости от балла."""
-
     if score <= 8:
         return _build_pdf("ПРОФИЛЬ: УСТОЙЧИВОСТЬ", score, "Тип I — Интегрированный", [
             {"heading": "01 / ОБЩАЯ КАРТИНА", "paragraphs": [
@@ -436,51 +543,30 @@ def build_question_keyboard(q_index: int) -> InlineKeyboardMarkup:
     ])
 
 
-def build_payment_keyboard(pay_url: str) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(
-            text="💳 Оплатить доступ к отчёту  390 руб  [было 690 руб]",
-            url=pay_url,
-        )],
-        [InlineKeyboardButton(text="🔄 Проверить оплату", callback_data="check_payment")],
-    ])
-
-
 def get_verdict(score: int) -> str:
     if score <= 8:
-        label, desc = "ТИП I — УСТОЙЧИВОСТЬ", (
-            "Система интегрирована. Паттерны осознаны. Ресурс доступен.\n"
-            "Вектор — расширение.\n\n"
-            "Отчёт содержит карту роста и протокол следующего уровня."
-        )
+        label = "ТИП I — УСТОЙЧИВОСТЬ"
+        desc  = "Система интегрирована. Паттерны осознаны. Ресурс доступен.\nВектор — расширение."
     elif score <= 12:
-        label, desc = "ТИП II — ФОНОВОЕ НАПРЯЖЕНИЕ", (
-            "Адаптация работает — но стоит ресурса.\n"
-            "Система стабильна, движение — затруднено.\n\n"
-            "Отчёт содержит источники утечки и протокол восстановления баланса."
-        )
+        label = "ТИП II — ФОНОВОЕ НАПРЯЖЕНИЕ"
+        desc  = "Адаптация работает — но стоит ресурса.\nСистема стабильна, движение — затруднено."
     elif score <= 15:
-        label, desc = "ТИП III — СИСТЕМНАЯ ПЕРЕГРУЗКА", (
-            "Компенсация на пределе. Стабильность — иллюзия.\n"
-            "Разрыв между внешним и внутренним — значительный.\n\n"
-            "Отчёт содержит механику перегрузки и экстренный протокол."
-        )
+        label = "ТИП III — СИСТЕМНАЯ ПЕРЕГРУЗКА"
+        desc  = "Компенсация на пределе. Стабильность — иллюзия.\nРазрыв между внешним и внутренним — значительный."
     elif score <= 18:
-        label, desc = "ТИП IV — КРИТИЧЕСКОЕ ИСТОЩЕНИЕ", (
-            "Механизмы адаптации исчерпаны.\n"
-            "Система держится на инерции и волевом контроле.\n\n"
-            "Отчёт содержит приоритетный протокол и карту выхода."
-        )
+        label = "ТИП IV — КРИТИЧЕСКОЕ ИСТОЩЕНИЕ"
+        desc  = "Механизмы адаптации исчерпаны.\nСистема держится на инерции и волевом контроле."
     else:
-        label, desc = "ТИП V — ТОЧКА РАЗРЫВА", (
-            "Максимальный индекс нагрузки по всем векторам.\n"
-            "Старая система больше не функционирует.\n\n"
-            "Отчёт содержит протокол первых 72 часов и план на 30 дней."
-        )
+        label = "ТИП V — ТОЧКА РАЗРЫВА"
+        desc  = "Максимальный индекс нагрузки по всем векторам.\nСтарая система больше не функционирует."
     return f"░░ ВЕРДИКТ: {label} ░░\n\n{desc}"
 
 
+# ──────────────────────────────────────────────
+# РОУТЕР И ХЭНДЛЕРЫ
+# ──────────────────────────────────────────────
 def create_payment_link(user_id: int, score: int) -> tuple[str, str]:
+    import uuid
     label = f"{PAYMENT_LABEL_PREFIX}{user_id}_{uuid.uuid4().hex[:8]}"
     quickpay = Quickpay(
         receiver=YOOMONEY_WALLET,
@@ -493,49 +579,87 @@ def create_payment_link(user_id: int, score: int) -> tuple[str, str]:
     return quickpay.base_url, label
 
 
-def verify_payment_by_history(label: str) -> bool:
+def verify_payment(label: str) -> bool:
     try:
         client = Client(YOOMONEY_TOKEN)
         history = client.operation_history(label=label)
+        logger.info("YooMoney check | looking for label=%s amount>=%s", label, PAYMENT_AMOUNT)
+        if not history.operations:
+            logger.warning("YooMoney check | NO operations returned for label=%s", label)
         for op in history.operations:
-            if op.label == label and op.status == "success" and float(op.amount) >= PAYMENT_AMOUNT:
+            logger.info(
+                "YooMoney op | id=%s label=%s status=%s amount=%s",
+                op.operation_id, op.label, op.status, op.amount,
+            )
+            if op.label == label and op.status == "success" and float(op.amount) >= PAYMENT_AMOUNT * 0.97:
                 return True
     except Exception as exc:
         logger.error("YooMoney history check failed: %s", exc)
     return False
 
 
-# ──────────────────────────────────────────────
-# РОУТЕР И ХЭНДЛЕРЫ
-# ──────────────────────────────────────────────
+def build_payment_keyboard(pay_url: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(
+            text=f"💳 Оплатить {int(PAYMENT_AMOUNT)} руб  [тест]" if PAYMENT_AMOUNT <= 10
+                 else f"💳 Оплатить доступ  {int(PAYMENT_AMOUNT)} руб  [было 690 руб]",
+            url=pay_url,
+        )],
+        [InlineKeyboardButton(text="🔄 Проверить оплату", callback_data="check_payment")],
+    ])
+
+
 router = Router()
+
+
+async def send_question(target: Message, q_index: int, prev_message: Message | None = None) -> Message:
+    """Отправляет вопрос новым сообщением, предыдущее удаляет.
+    Возвращает новое сообщение для последующего удаления."""
+    text = QUESTIONS[q_index]["text"]
+    kb   = build_question_keyboard(q_index)
+    img  = IMG_QUESTIONS[q_index]
+
+    # Всегда удаляем предыдущее сообщение
+    if prev_message:
+        try:
+            await prev_message.delete()
+        except Exception:
+            pass
+
+    # Отправляем новое — с картинкой или без
+    if os.path.exists(img):
+        return await target.answer_photo(photo=FSInputFile(img), caption=text, reply_markup=kb)
+    else:
+        return await target.answer(text, reply_markup=kb)
 
 
 @router.message(Command("start"))
 async def cmd_start(message: Message, state: FSMContext) -> None:
     await state.clear()
-    await message.answer(
+    text = (
         "█ СИСТЕМА ИНИЦИАЛИЗИРОВАНА █\n\n"
         "Добро пожаловать в диагностический модуль <b>Квантового Разлома</b>.\n\n"
         "Перед вами — 5 вопросов.\n"
         "Нет правильных ответов. Есть только ваши.\n\n"
         "Результат: персональный отчёт с профилем и протоколом действий.\n\n"
-        "Готовы к диагнозу?",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="▶ Начать тест", callback_data="start_test")]
-        ]),
+        "Готовы к диагнозу?"
     )
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="▶ Начать тест", callback_data="start_test")]
+    ])
+    if os.path.exists(IMG_START):
+        await message.answer_photo(photo=FSInputFile(IMG_START), caption=text, reply_markup=kb)
+    else:
+        await message.answer(text, reply_markup=kb)
 
 
 @router.callback_query(F.data == "start_test")
 async def cb_start_test(callback: CallbackQuery, state: FSMContext) -> None:
     await state.set_state(TestState.answering)
     await state.update_data(q_index=0, score=0)
-    await callback.message.edit_text(
-        QUESTIONS[0]["text"],
-        reply_markup=build_question_keyboard(0),
-    )
     await callback.answer()
+    new_msg = await send_question(callback.message, 0, prev_message=callback.message)
+    await state.update_data(last_msg_id=new_msg.message_id)
 
 
 @router.callback_query(StateFilter(TestState.answering), F.data.startswith("ans:"))
@@ -558,38 +682,72 @@ async def cb_answer(callback: CallbackQuery, state: FSMContext) -> None:
 
     if next_q < len(QUESTIONS):
         await state.update_data(q_index=next_q, score=new_score)
-        await callback.message.edit_text(
-            QUESTIONS[next_q]["text"],
-            reply_markup=build_question_keyboard(next_q),
-        )
-    else:
-        user_id = callback.from_user.id
-        user_scores[user_id] = new_score
-        await state.update_data(score=new_score)
+        await callback.answer()
+        new_msg = await send_question(callback.message, next_q, prev_message=callback.message)
+        await state.update_data(last_msg_id=new_msg.message_id)
+        return
 
-        try:
-            pay_url, label = create_payment_link(user_id, new_score)
-            pending_payments[label] = user_id
-            await state.update_data(payment_label=label)
-            await state.set_state(TestState.awaiting_payment)
-            await callback.message.edit_text(
-                f"{get_verdict(new_score)}\n\n"
-                "──────────────────────\n"
-                "Полный отчёт с протоколом действий <b>заблокирован</b>.\n"
-                "Для разблокировки — произведите оплату.",
+    # ── Последний вопрос ──────────────────────
+    await callback.answer()
+    await state.set_state(TestState.generating)
+    await state.update_data(score=new_score)
+
+    verdict = get_verdict(new_score)
+
+    # ШАГ 1: удаляем сообщение с вопросом, отправляем лоадер новым сообщением
+    try:
+        await callback.message.delete()
+    except Exception:
+        pass
+    loader_msg = await callback.message.answer(
+        f"{verdict}\n\n──────────────────────\n"
+        f"<code>░░░░░░░░░░   0%</code>\n<i>Инициализация...</i>"
+    )
+
+    # ШАГ 2: только ПОСЛЕ того как экран отрисован — запускаем генерацию PDF в фоне
+    loop = asyncio.get_event_loop()
+    pdf_future = loop.run_in_executor(None, generate_report, new_score)
+
+    # ШАГ 3: анимируем лоадер (параллельно с генерацией в фоне)
+    await show_loader(loader_msg, verdict)
+
+    # ШАГ 4: лоадер закончился — ждём PDF (уже готов в фоне)
+    await pdf_future  # убеждаемся что генерация завершена без ошибок
+
+    user_id = callback.from_user.id
+    try:
+        pay_url, label = create_payment_link(user_id, new_score)
+        db_set(f'pending:{label}', user_id)
+        db_set(f'score:{user_id}', new_score)
+        await state.update_data(payment_label=label)
+        await state.set_state(TestState.awaiting_payment)
+
+        # Финальная картинка + кнопка оплаты
+        verdict_short = get_verdict(new_score)
+        pay_caption = (
+            f"{verdict_short}\n\n"
+            "──────────────────────\n"
+            "Полный отчёт с протоколом действий <b>заблокирован</b>.\n"
+            "Для разблокировки — произведите оплату."
+        )
+        if os.path.exists(IMG_FINAL):
+            await loader_msg.answer_photo(
+                photo=FSInputFile(IMG_FINAL),
+                caption=pay_caption,
                 reply_markup=build_payment_keyboard(pay_url),
             )
-        except Exception as exc:
-            logger.error("Payment link creation failed for user %s: %s", user_id, exc)
-            await callback.message.edit_text("Система временно недоступна. Попробуйте /start")
+        else:
+            await loader_msg.answer(pay_caption, reply_markup=build_payment_keyboard(pay_url))
 
-    await callback.answer()
+    except Exception as exc:
+        logger.error("Payment link creation failed for user %s: %s", callback.from_user.id, exc)
+        await loader_msg.answer("Система временно недоступна. Попробуйте /start")
 
 
 @router.callback_query(StateFilter(TestState.awaiting_payment), F.data == "check_payment")
 async def cb_check_payment(callback: CallbackQuery, state: FSMContext) -> None:
     data = await state.get_data()
-    label: Optional[str] = data.get("payment_label")
+    label: str | None = data.get("payment_label")
     score: int = data.get("score", 0)
 
     if not label:
@@ -597,7 +755,8 @@ async def cb_check_payment(callback: CallbackQuery, state: FSMContext) -> None:
         return
 
     await callback.answer("Проверяю платёж…")
-    if verify_payment_by_history(label):
+    paid = await asyncio.get_event_loop().run_in_executor(None, verify_payment, label)
+    if paid:
         await deliver_report(callback.message, score, state)
     else:
         await callback.message.answer(
@@ -607,7 +766,7 @@ async def cb_check_payment(callback: CallbackQuery, state: FSMContext) -> None:
 
 async def deliver_report(message: Message, score: int, state: FSMContext) -> None:
     try:
-        pdf_bytes = generate_report(score)
+        pdf_bytes = await asyncio.get_event_loop().run_in_executor(None, generate_report, score)
         await message.answer_document(
             BufferedInputFile(pdf_bytes, filename="quantum_break_report.pdf"),
             caption=(
@@ -616,50 +775,11 @@ async def deliver_report(message: Message, score: int, state: FSMContext) -> Non
                 "Система не ждёт — но и не торопит."
             ),
         )
-        logger.info("Report delivered. Score=%d", score)
+        logger.info("Report delivered after payment. Score=%d", score)
         await state.clear()
     except Exception as exc:
         logger.error("Failed to generate/send PDF: %s", exc)
         await message.answer("Ошибка при генерации отчёта. Свяжитесь с поддержкой.")
-
-
-# ──────────────────────────────────────────────
-# YOOMONEY WEBHOOK
-# ──────────────────────────────────────────────
-async def yoomoney_notify_handler(request: web.Request) -> web.Response:
-    try:
-        data = await request.post()
-        logger.info("YooMoney notify: %s", dict(data))
-
-        check_str = "&".join([
-            data.get("notification_type", ""), data.get("operation_id", ""),
-            data.get("amount", ""), data.get("currency", ""),
-            data.get("datetime", ""), data.get("sender", ""),
-            data.get("codepro", ""), YOOMONEY_SECRET, data.get("label", ""),
-        ])
-        expected = hashlib.sha1(check_str.encode()).hexdigest()
-
-        if expected != data.get("sha1_hash", ""):
-            logger.warning("YooMoney: invalid SHA1 for label=%s", data.get("label"))
-            return web.Response(status=400, text="bad signature")
-
-        label = data.get("label", "")
-        if label in pending_payments:
-            user_id = pending_payments.pop(label)
-            score = user_scores.get(user_id, 0)
-            bot: Bot = request.app["bot"]
-            pdf_bytes = generate_report(score)
-            await bot.send_document(
-                user_id,
-                BufferedInputFile(pdf_bytes, filename="quantum_break_report.pdf"),
-                caption="█ ОПЛАТА ПОДТВЕРЖДЕНА █\n\nВаш отчёт — ниже.\nДействуйте по протоколу.",
-            )
-            logger.info("Auto-delivered report via webhook. user_id=%s score=%d", user_id, score)
-
-    except Exception as exc:
-        logger.error("YooMoney notify handler error: %s", exc)
-
-    return web.Response(status=200, text="ok")
 
 
 # ──────────────────────────────────────────────
@@ -675,6 +795,43 @@ async def telegram_webhook_handler(request: web.Request) -> web.Response:
     except Exception as exc:
         logger.error("Telegram webhook error: %s", exc)
     return web.Response(status=200)
+
+
+import hashlib
+
+async def yoomoney_notify_handler(request: web.Request) -> web.Response:
+    try:
+        data = await request.post()
+        logger.info("YooMoney notify: %s", dict(data))
+
+        check_str = "&".join([
+            data.get("notification_type", ""), data.get("operation_id", ""),
+            data.get("amount", ""),            data.get("currency", ""),
+            data.get("datetime", ""),          data.get("sender", ""),
+            data.get("codepro", ""),           YOOMONEY_SECRET,
+            data.get("label", ""),
+        ])
+        expected = hashlib.sha1(check_str.encode()).hexdigest()
+        if expected != data.get("sha1_hash", ""):
+            logger.warning("YooMoney: invalid SHA1 for label=%s", data.get("label"))
+            return web.Response(status=400, text="bad signature")
+
+        label = data.get("label", "")
+        user_id = db_get(f'pending:{label}')
+        if user_id is not None:
+            db_del(f'pending:{label}')
+            score = db_get(f'score:{user_id}', 0)
+            bot: Bot = request.app["bot"]
+            pdf_bytes = generate_report(score)
+            await bot.send_document(
+                user_id,
+                BufferedInputFile(pdf_bytes, filename="quantum_break_report.pdf"),
+                caption="█ ОПЛАТА ПОДТВЕРЖДЕНА █\n\nВаш отчёт — ниже.\nДействуйте по протоколу.",
+            )
+            logger.info("Auto-delivered via webhook. user_id=%s score=%d", user_id, score)
+    except Exception as exc:
+        logger.error("YooMoney notify handler error: %s", exc)
+    return web.Response(status=200, text="ok")
 
 
 async def on_startup(app: web.Application) -> None:
