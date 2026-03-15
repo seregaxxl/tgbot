@@ -50,7 +50,7 @@ YOOMONEY_TOKEN: str  = os.getenv("YOOMONEY_TOKEN", "YOUR_YOOMONEY_TOKEN")
 YOOMONEY_WALLET: str = os.getenv("YOOMONEY_WALLET", "YOUR_WALLET_NUMBER")
 YOOMONEY_SECRET: str = os.getenv("YOOMONEY_SECRET", "YOUR_YOOMONEY_SECRET")
 YOOMONEY_NOTIFY_PATH: str = "/webhook/yoomoney"
-PAYMENT_AMOUNT: float = 1.0          # ← 1 рубль для теста, потом сменить на 390.0
+PAYMENT_AMOUNT: float = 3.0          # ← 1 рубль для теста, потом сменить на 390.0
 PAYMENT_LABEL_PREFIX: str = "report_"
 
 # Пути к картинкам (положите файлы в assets/ рядом с bot.py)
@@ -129,27 +129,8 @@ def _register_fonts() -> None:
 
 _register_fonts()
 
-import shelve
-import threading
-
-_db_lock = threading.Lock()
-DB_PATH = os.path.join(BASE_DIR, "payments_db")  # файл payments_db.db рядом с bot.py
-
-def db_set(key: str, value) -> None:
-    with _db_lock:
-        with shelve.open(DB_PATH) as db:
-            db[key] = value
-
-def db_get(key: str, default=None):
-    with _db_lock:
-        with shelve.open(DB_PATH) as db:
-            return db.get(key, default)
-
-def db_del(key: str) -> None:
-    with _db_lock:
-        with shelve.open(DB_PATH) as db:
-            if key in db:
-                del db[key]
+pending_payments: dict[str, int] = {}
+user_scores: dict[int, int] = {}
 
 # ──────────────────────────────────────────────
 # ВОПРОСЫ ТЕСТА
@@ -583,15 +564,8 @@ def verify_payment(label: str) -> bool:
     try:
         client = Client(YOOMONEY_TOKEN)
         history = client.operation_history(label=label)
-        logger.info("YooMoney check | looking for label=%s amount>=%s", label, PAYMENT_AMOUNT)
-        if not history.operations:
-            logger.warning("YooMoney check | NO operations returned for label=%s", label)
         for op in history.operations:
-            logger.info(
-                "YooMoney op | id=%s label=%s status=%s amount=%s",
-                op.operation_id, op.label, op.status, op.amount,
-            )
-            if op.label == label and op.status == "success" and float(op.amount) >= PAYMENT_AMOUNT * 0.97:
+            if op.label == label and op.status == "success" and float(op.amount) >= PAYMENT_AMOUNT:
                 return True
     except Exception as exc:
         logger.error("YooMoney history check failed: %s", exc)
@@ -715,10 +689,11 @@ async def cb_answer(callback: CallbackQuery, state: FSMContext) -> None:
     await pdf_future  # убеждаемся что генерация завершена без ошибок
 
     user_id = callback.from_user.id
+    user_scores[user_id] = new_score
+
     try:
         pay_url, label = create_payment_link(user_id, new_score)
-        db_set(f'pending:{label}', user_id)
-        db_set(f'score:{user_id}', new_score)
+        pending_payments[label] = user_id
         await state.update_data(payment_label=label)
         await state.set_state(TestState.awaiting_payment)
 
@@ -817,10 +792,9 @@ async def yoomoney_notify_handler(request: web.Request) -> web.Response:
             return web.Response(status=400, text="bad signature")
 
         label = data.get("label", "")
-        user_id = db_get(f'pending:{label}')
-        if user_id is not None:
-            db_del(f'pending:{label}')
-            score = db_get(f'score:{user_id}', 0)
+        if label in pending_payments:
+            user_id = pending_payments.pop(label)
+            score   = user_scores.get(user_id, 0)
             bot: Bot = request.app["bot"]
             pdf_bytes = generate_report(score)
             await bot.send_document(
