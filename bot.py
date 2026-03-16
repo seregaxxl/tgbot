@@ -50,7 +50,7 @@ YOOMONEY_TOKEN: str  = os.getenv("YOOMONEY_TOKEN", "YOUR_YOOMONEY_TOKEN")
 YOOMONEY_WALLET: str = os.getenv("YOOMONEY_WALLET", "YOUR_WALLET_NUMBER")
 YOOMONEY_SECRET: str = os.getenv("YOOMONEY_SECRET", "YOUR_YOOMONEY_SECRET")
 YOOMONEY_NOTIFY_PATH: str = "/webhook/yoomoney"
-PAYMENT_AMOUNT: float = 3.0          # ← 1 рубль для теста, потом сменить на 390.0
+PAYMENT_AMOUNT: float = 390.0          # ← 1 рубль для теста, потом сменить на 390.0
 PAYMENT_LABEL_PREFIX: str = "report_"
 
 # Пути к картинкам (положите файлы в assets/ рядом с bot.py)
